@@ -2,6 +2,7 @@
 
 本项目基于学习通刷课助手 **1.0.10 版本**进行优化（同样需要搭配油猴插件），保留原有课程任务处理功能，并改进大模型答题、图片题识别和答案填写逻辑。
 
+原项目：[DaRin1403/xuexitong-autostudy](https://github.com/DaRin1403/xuexitong-autostudy)。本项目保留原作者的版权声明，依据 [MIT 许可证](LICENSE)发布。
 ## 主要优化
 
 - 优化了原版 DeepSeek 接入和模型配置的问题。
