@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通刷课助手
 // @namespace    cx-auto-study
-// @version      1.0.20
+// @version      1.0.21
 // @description  学习通任务点自动完成:视频/音频原速静音连播、自动切章、弹题与章节测验自动答题(字体加密自动解密 + DeepSeek AI 作答)、文档/图片任务处理、拟人化防检测;互评页按答案生成建议分,由人确认后提交
 // @author       cx-auto-study contributors
 // @license      MIT
@@ -64,6 +64,22 @@
     reportUrl: '',          // 状态上报地址(调试用,留空=关闭);如 http://127.0.0.1:8790/report
   };
 
+  // 把中转站常见的地址写法补全为 OpenAI 兼容的 chat/completions 地址:
+  // 以 /chat/completions 结尾原样使用;只有域名补 /v1/chat/completions;带路径(/v1、/api/v3 等)补 /chat/completions
+  function normalizeAIUrl(raw) {
+    let url = String(raw || '').trim().replace(/\/+$/, '');
+    if (!url) return '';
+    if (!/^https?:\/\//i.test(url)) {
+      url = (/^(localhost|127\.0\.0\.1)(:|\/|$)/i.test(url) ? 'http://' : 'https://') + url;
+    }
+    if (/[?#]/.test(url)) return url;  // 带查询参数的特殊地址不改动
+    if (/\/chat\/completions$/i.test(url)) return url;
+    url = url.replace(/\/models$/i, '');
+    let path = '';
+    try { path = new URL(url).pathname; } catch (e) { return url; }
+    return url + (!path || path === '/' ? '/v1/chat/completions' : '/chat/completions');
+  }
+
   function loadConfig() {
     try {
       const saved = (typeof GM_getValue !== 'undefined')
@@ -71,6 +87,7 @@
         : JSON.parse(localStorage.getItem('cxConfig') || 'null');
       if (saved && typeof saved === 'object') {
         const cfg = Object.assign({}, DEFAULT_CONFIG, saved);
+        cfg.aiUrl = normalizeAIUrl(cfg.aiUrl) || DEFAULT_CONFIG.aiUrl;
         if (/^https?:\/\/api\.deepseek\.com(?:\/|$)/i.test(cfg.aiUrl) && /^(deepseek-chat|deepseek-reasoner)$/i.test(cfg.aiModel)) {
           cfg.aiModel = 'deepseek-v4-pro';
         }
@@ -625,10 +642,12 @@
       '<div class="field"><div class="label">🖼️ 图片题视觉输入</div>' +
         '<input id="cfgAIVision" type="checkbox" ' + (CONFIG.aiVisionEnabled ? 'checked' : '') + '>' +
         '<input id="cfgAIVisionModel" type="text" placeholder="留空 = 使用上方 AI 模型" value="' + CONFIG.aiVisionModel + '" style="margin-top:6px">' +
-        '<div class="hint">开启后自动提取题目图片并截取画布图形;官方 DeepSeek 图片题固定使用 deepseek-flash。其他平台填该平台支持图片的模型名,留空则用上方 AI 模型(需本身支持图片)。图片无法读取时跳过该题。</div></div>' +
+        '<select id="cfgVisionModelSelect" style="display:none;margin-top:6px"></select>' +
+        '<button id="cfgFetchVisionModels" type="button" style="margin-top:6px">📋 自动获取模型列表</button>' +
+        '<div class="hint">开启后自动提取题目图片并截取画布图形;官方 DeepSeek 图片题固定使用 deepseek-flash。其他平台填该平台支持图片的模型名(可点按钮拉取列表选择,接口标注为仅文字的模型不会列出),留空则用上方 AI 模型(需本身支持图片)。图片无法读取时跳过该题。</div></div>' +
       '<div class="field"><div class="label">🌐 AI 接口地址</div>' +
         '<input id="cfgAIUrl" type="text" value="' + CONFIG.aiUrl + '">' +
-        '<div class="hint">OpenAI 兼容接口地址(以 /chat/completions 结尾)。默认 DeepSeek;MiniMax、智谱、硅基流动等平台的地址见仓库 docs/get-api-key.md</div></div>' +
+        '<div class="hint">OpenAI 兼容接口地址。中转站可直接填它给的地址(如 https://api.xxx.com 或 https://api.xxx.com/v1),保存时自动补全为 .../chat/completions;只有域名时补 /v1/chat/completions。默认 DeepSeek</div></div>' +
       '<div class="field"><div class="label">🎭 故意答错率(%)</div>' +
         '<input id="cfgErrRate" type="number" step="1" min="0" max="20" value="' + Math.round(CONFIG.deliberateErrorRate * 100) + '">' +
         '<div class="hint">拟人化:真人不会全对。填 8 = 8% 概率故意答错(判断题反着点、单选题点错项);填 0 关闭;多选不受影响</div></div>' +
@@ -658,7 +677,8 @@
       CONFIG.aiModel = document.getElementById('cfgAIModel').value.trim() || 'deepseek-v4-pro';
       CONFIG.aiVisionEnabled = document.getElementById('cfgAIVision').checked;
       CONFIG.aiVisionModel = document.getElementById('cfgAIVisionModel').value.trim();  // 留空 = 使用主模型
-      CONFIG.aiUrl = document.getElementById('cfgAIUrl').value.trim() || 'https://api.deepseek.com/v1/chat/completions';
+      const rawAIUrl = document.getElementById('cfgAIUrl').value.trim();
+      CONFIG.aiUrl = normalizeAIUrl(rawAIUrl) || DEFAULT_CONFIG.aiUrl;
       CONFIG.deliberateErrorRate = (parseFloat(document.getElementById('cfgErrRate').value) || 0) / 100;
       CONFIG.dailyLimitMinutes = parseFloat(document.getElementById('cfgDaily').value) || 0;
       CONFIG.autoSubmit = document.getElementById('cfgSubmit').checked;
@@ -666,6 +686,7 @@
       CONFIG.reportUrl = document.getElementById('cfgReport').value.trim();
       saveConfig(CONFIG);
       log('配置已保存(倍速 ' + CONFIG.speed + 'x, AI ' + (CONFIG.aiEnabled ? '开' : '关') + ')', 'ok');
+      log('AI 实际请求地址:' + CONFIG.aiUrl + (rawAIUrl && rawAIUrl.replace(/\/+$/, '') !== CONFIG.aiUrl ? '(已由填写的地址自动补全)' : ''), 'info');
       panel.remove();
     });
     document.getElementById('cfgClose').addEventListener('click', () => panel.remove());
@@ -688,57 +709,93 @@
       // 视觉模型名各平台不同:DeepSeek 用 deepseek-flash,其他平台先留空(使用主模型),需要时手动填
       document.getElementById('cfgAIVisionModel').value = e.target.value === 'deepseek' ? 'deepseek-flash' : '';
       document.getElementById('cfgModelSelect').style.display = 'none';  // 已拉取的列表属于上一个平台
+      document.getElementById('cfgVisionModelSelect').style.display = 'none';
     });
-    // 下拉列表和输入框保持一致;输入框里的模型不在列表中时,下拉回到提示项
-    const modelInput = document.getElementById('cfgAIModel');
-    const modelSelect = document.getElementById('cfgModelSelect');
-    const syncModelSelect = () => {
-      modelSelect.value = modelInput.value.trim();
-      if (modelSelect.selectedIndex < 0) modelSelect.selectedIndex = 0;
-    };
-    modelSelect.addEventListener('change', () => {
-      if (modelSelect.value) modelInput.value = modelSelect.value;
-    });
-    modelInput.addEventListener('input', syncModelSelect);
-    // 模型 ID 来自外部接口,只按纯文本写入选项
-    const addModelOption = (value, text) => {
-      const option = document.createElement('option');
-      option.value = value;
-      option.textContent = text;
-      modelSelect.appendChild(option);
-    };
-    // 自动拉取模型列表:调 OpenAI 兼容的 /models 接口,填充下拉列表
-    document.getElementById('cfgFetchModels').addEventListener('click', async () => {
-      const base = document.getElementById('cfgAIUrl').value.trim();
-      const key = document.getElementById('cfgAIKey').value.trim();
-      const btn = document.getElementById('cfgFetchModels');
-      if (!base) { log('请先填写 AI 接口地址', 'warn'); return; }
-      const modelsUrl = base.replace(/\/chat\/completions\/?$/, '/models');
-      btn.disabled = true;
-      const old = btn.textContent;
-      btn.textContent = '拉取中...';
-      try {
-        const text = await cxFetch(modelsUrl, { method: 'GET', headers: { 'Authorization': 'Bearer ' + key }, timeout: 15000 });
-        const obj = JSON.parse(text);
-        const list = Array.from(new Set((obj.data || []).map((m) => m.id).filter(Boolean).map(String)));
-        if (list.length) {
-          modelSelect.textContent = '';
-          addModelOption('', '请选择模型(共 ' + list.length + ' 个)');
-          list.forEach((id) => addModelOption(id, id));
-          syncModelSelect();
-          modelSelect.style.display = '';
-          log('✅ 已拉取 ' + list.length + ' 个模型:' + list.join('、') + '。请在下拉列表中选择', 'ok');
-        } else {
-          modelSelect.style.display = 'none';
-          log('该平台未返回模型列表,请手动填写', 'warn');
+    // 模型下拉:主模型和图片题模型共用。下拉和输入框保持一致;输入框里的模型不在列表中时,下拉回到提示项
+    const setupModelPicker = ({ inputId, selectId, buttonId, vision }) => {
+      const modelInput = document.getElementById(inputId);
+      const modelSelect = document.getElementById(selectId);
+      const btn = document.getElementById(buttonId);
+      const title = vision ? '图片题模型' : '模型';
+      const syncModelSelect = () => {
+        modelSelect.value = modelInput.value.trim();
+        if (modelSelect.selectedIndex < 0) modelSelect.selectedIndex = 0;
+      };
+      modelSelect.addEventListener('change', () => {
+        if (modelSelect.value) modelInput.value = modelSelect.value;
+      });
+      modelInput.addEventListener('input', syncModelSelect);
+      // 模型 ID 来自外部接口,只按纯文本写入选项
+      const addModelOption = (value, text) => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = text;
+        modelSelect.appendChild(option);
+      };
+      const fail = (msg) => { modelSelect.style.display = 'none'; log(msg, 'warn'); };
+      // 自动拉取模型列表:调 OpenAI 兼容的 /models 接口,填充下拉列表
+      btn.addEventListener('click', async () => {
+        const urlInput = document.getElementById('cfgAIUrl');
+        const base = normalizeAIUrl(urlInput.value);
+        const key = document.getElementById('cfgAIKey').value.trim();
+        if (!base) { log('请先填写 AI 接口地址', 'warn'); return; }
+        urlInput.value = base;  // 显示补全后的地址
+        const modelsUrl = base.replace(/\/chat\/completions$/i, '/models');
+        btn.disabled = true;
+        const old = btn.textContent;
+        btn.textContent = '拉取中...';
+        try {
+          const text = await cxFetch(modelsUrl, { method: 'GET', headers: { 'Authorization': 'Bearer ' + key }, timeout: 15000 });
+          let obj;
+          try { obj = JSON.parse(text); } catch (e) {
+            fail('拉取失败:' + modelsUrl + ' 返回的不是 JSON(地址可能不对),请检查接口地址或手动填写模型名。返回开头:' + String(text).replace(/\s+/g, ' ').slice(0, 100));
+            return;
+          }
+          if (obj && obj.error) {
+            fail('拉取失败:' + describeAIError(obj.error) + '。请检查 Key 或手动填写模型名');
+            return;
+          }
+          // 选项值是请求要用的模型 id;接口若返回完整名称(name)和输入类型(input_modalities),一并显示在选项文字里
+          const entries = new Map();
+          let textOnly = 0;
+          (Array.isArray(obj.data) ? obj.data : []).forEach((m) => {
+            if (!m || !m.id || entries.has(String(m.id))) return;
+            const id = String(m.id);
+            const modalities = Array.isArray(m.input_modalities) ? m.input_modalities : null;
+            // 图片题列表:接口明确标注"仅文字"的模型不列出;没有标注的(多数中转站)全部列出
+            if (vision && modalities && !modalities.includes('image')) { textOnly++; return; }
+            const extra = [];
+            if (typeof m.name === 'string' && m.name.trim() && m.name.trim() !== id) extra.push(m.name.trim());
+            if (modalities) extra.push(modalities.includes('image') ? '支持图片' : '仅文字');
+            entries.set(id, extra.length ? id + '(' + extra.join(' · ') + ')' : id);
+          });
+          const list = Array.from(entries.keys());
+          if (list.length) {
+            modelSelect.textContent = '';
+            addModelOption('', '请选择' + title + '(共 ' + list.length + ' 个)');
+            list.forEach((id) => addModelOption(id, entries.get(id)));
+            syncModelSelect();
+            modelSelect.style.display = '';
+            log('✅ 已拉取 ' + list.length + ' 个' + title + ':' + list.map((id) => entries.get(id)).join('、') +
+              (textOnly ? '(已隐藏 ' + textOnly + ' 个仅文字模型)' : '') + '。请在下拉列表中选择', 'ok');
+            if (vision && /^https?:\/\/api\.deepseek\.com(?:\/|$)/i.test(base)) {
+              log('提示:DeepSeek 官方接口的图片题固定使用 deepseek-flash,这里的选择不会生效', 'warn');
+            } else if (vision && !list.some((id) => /支持图片/.test(entries.get(id)))) {
+              log('提示:该平台没有标注哪些模型支持图片,请选择名称里带 vl / vision 等字样或平台说明支持图片的模型', 'info');
+            }
+          } else {
+            fail(textOnly ? '该平台没有支持图片的模型(' + textOnly + ' 个均为仅文字)' : '该平台未返回模型列表,请手动填写');
+          }
+        } catch (e) {
+          fail('拉取失败(该平台可能不支持 /models 接口),请手动填写模型名');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = old;
         }
-      } catch (e) {
-        modelSelect.style.display = 'none';
-        log('拉取失败(该平台可能不支持 /models 接口),请手动填写模型名', 'warn');
-      }
-      btn.disabled = false;
-      btn.textContent = old;
-    });
+      });
+    };
+    setupModelPicker({ inputId: 'cfgAIModel', selectId: 'cfgModelSelect', buttonId: 'cfgFetchModels', vision: false });
+    setupModelPicker({ inputId: 'cfgAIVisionModel', selectId: 'cfgVisionModelSelect', buttonId: 'cfgFetchVisionModels', vision: true });
   }
 
   /* ==================== 答案通道 ==================== */
@@ -795,13 +852,21 @@
   let aiCooldownUntil = 0;
   let aiCooldownWarned = false;
   const aiParamFallback = new Set();  // 需要 max_completion_tokens 的"接口地址|模型"
+  // 中转站常把错误放在 HTTP 200 的 JSON 里:{ error: { message } } 或 { error: "..." }
+  function describeAIError(err) {
+    if (!err) return '';
+    if (typeof err === 'string') return err.slice(0, 180);
+    const msg = err.message || err.msg || JSON.stringify(err);
+    return String(msg).slice(0, 180);
+  }
   function channelAI(q) {
     return requestAI({
       system: '你是答题助手。按照题型要求直接给出答案,简答计算题可以给出必要的计算步骤,不要输出内部思考过程、重复题目或无关内容。',
       prompt: buildAIPrompt(q),
       images: q.imageData,
       visionHint: '请结合附带图片识别题目中的图表、公式、几何关系或文字,再作答。',
-      fallbackMaxTokens: String(q.type) === '2' ? 4096 : 512,
+      // 非 DeepSeek 官方接口的输出上限;推理模型的思考也计入上限,只是上限,按实际输出计费
+      fallbackMaxTokens: ['0', '1', '3'].includes(String(q.type)) ? 2048 : String(q.type) === '2' ? 4096 : 8192,
       parse: (content) => parseAIAnswer(q.type, content)
     });
   }
@@ -887,6 +952,15 @@
           try {
             if (res.status !== 200) {
               const errText = String(res.responseText);
+              // 部分平台/模型的输出上限低于 8192(如 4095),报"超出范围"时降到 4096 重试一次
+              if (res.status === 400 && !retried && (body.max_tokens || 0) > 4096 &&
+                  /max_tokens|max_new_tokens|max_output_tokens/i.test(errText) &&
+                  /exceed|too large|maximum|must be|less than|range|超过|最大|范围/i.test(errText)) {
+                log('该模型的输出上限较低,已改为 4096 重试', 'warn');
+                body.max_tokens = 4096;
+                send(body, true);
+                return;
+              }
               if (res.status === 400 && !retried && !aiParamFallback.has(paramKey) &&
                   /max_tokens|max_completion_tokens|temperature/i.test(errText) &&
                   /unsupported|not supported|does not support/i.test(errText)) {
@@ -900,11 +974,18 @@
               done([], `HTTP ${res.status}: ${errText.slice(0, 180)}`);
               return;
             }
-            const obj = JSON.parse(res.responseText);
-            const choice = obj.choices && obj.choices[0];
-            if (!choice) { done([], '响应中没有 choices[0]'); return; }
+            let obj;
+            try { obj = JSON.parse(res.responseText); } catch (e) {
+              done([], '返回的不是 JSON,请检查接口地址(实际请求 ' + CONFIG.aiUrl + ')。返回开头:' + String(res.responseText).replace(/\s+/g, ' ').slice(0, 100));
+              return;
+            }
+            if (obj && obj.error) { done([], '接口返回错误:' + describeAIError(obj.error)); return; }
+            const choice = obj && obj.choices && obj.choices[0];
+            if (!choice) { done([], '响应中没有 choices[0]:' + JSON.stringify(obj).slice(0, 120)); return; }
             if (choice.finish_reason === 'length') {
-              done([], '输出达到 token 上限;本次未计入接口故障冷却。DeepSeek 思考已保持开启,请检查模型输出上限或题目上下文', false);
+              done([], isOfficialDeepSeek
+                ? '输出达到 token 上限;本次未计入接口故障冷却。DeepSeek 思考已保持开启,请检查模型输出上限或题目上下文'
+                : `输出达到 token 上限(${body.max_completion_tokens || body.max_tokens});本次未计入接口故障冷却。该模型思考过长或平台限制了输出长度,可换用非推理模型`, false);
               return;
             }
             const message = choice.message || {};
@@ -2327,7 +2408,7 @@
       prompt: buildPeerPrompt(q),
       images,
       visionHint: '请先识别图片内容,再结合文字评估。',
-      fallbackMaxTokens: 1024,
+      fallbackMaxTokens: 4096,
       parse: (content) => parsePeerResult(content, q.range)
     });
     if (form !== 'AI') return { manual: 'AI 通道冷却中,请稍后重试' };
