@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通刷课助手
 // @namespace    cx-auto-study
-// @version      1.0.19
+// @version      1.0.20
 // @description  学习通任务点自动完成:视频/音频原速静音连播、自动切章、弹题与章节测验自动答题(字体加密自动解密 + DeepSeek AI 作答)、文档/图片任务处理、拟人化防检测;互评页按答案生成建议分,由人确认后提交
 // @author       cx-auto-study contributors
 // @license      MIT
@@ -25,6 +25,7 @@
 // @connect      cdn.jsdelivr.net
 // @connect      chaoxing.com
 // @connect      cldisk.com
+// @connect      *
 // @noframes
 // ==/UserScript==
 //
@@ -72,6 +73,10 @@
         const cfg = Object.assign({}, DEFAULT_CONFIG, saved);
         if (/^https?:\/\/api\.deepseek\.com(?:\/|$)/i.test(cfg.aiUrl) && /^(deepseek-chat|deepseek-reasoner)$/i.test(cfg.aiModel)) {
           cfg.aiModel = 'deepseek-v4-pro';
+        }
+        // deepseek-flash 只存在于 DeepSeek 官方接口;其他平台沿用它会让图片题必然失败,改为留空(使用主模型)
+        if (!/^https?:\/\/api\.deepseek\.com(?:\/|$)/i.test(cfg.aiUrl) && /^deepseek-flash$/i.test(cfg.aiVisionModel || '')) {
+          cfg.aiVisionModel = '';
         }
         return cfg;
       }
@@ -619,8 +624,8 @@
         '<div class="hint">先填好上方 Key 和接口地址,再点按钮:自动拉取该平台的可用模型,在下拉列表中选择,无需手动抄模型名。拉取失败就手动填(各平台模型名见仓库 docs/get-api-key.md)</div></div>' +
       '<div class="field"><div class="label">🖼️ 图片题视觉输入</div>' +
         '<input id="cfgAIVision" type="checkbox" ' + (CONFIG.aiVisionEnabled ? 'checked' : '') + '>' +
-        '<input id="cfgAIVisionModel" type="text" value="' + CONFIG.aiVisionModel + '" style="margin-top:6px">' +
-        '<div class="hint">开启后自动提取题目图片并截取画布图形;官方 DeepSeek 图片题使用 deepseek-flash。图片无法读取时跳过该题。</div></div>' +
+        '<input id="cfgAIVisionModel" type="text" placeholder="留空 = 使用上方 AI 模型" value="' + CONFIG.aiVisionModel + '" style="margin-top:6px">' +
+        '<div class="hint">开启后自动提取题目图片并截取画布图形;官方 DeepSeek 图片题固定使用 deepseek-flash。其他平台填该平台支持图片的模型名,留空则用上方 AI 模型(需本身支持图片)。图片无法读取时跳过该题。</div></div>' +
       '<div class="field"><div class="label">🌐 AI 接口地址</div>' +
         '<input id="cfgAIUrl" type="text" value="' + CONFIG.aiUrl + '">' +
         '<div class="hint">OpenAI 兼容接口地址(以 /chat/completions 结尾)。默认 DeepSeek;MiniMax、智谱、硅基流动等平台的地址见仓库 docs/get-api-key.md</div></div>' +
@@ -652,7 +657,7 @@
       CONFIG.aiKey = document.getElementById('cfgAIKey').value.trim();
       CONFIG.aiModel = document.getElementById('cfgAIModel').value.trim() || 'deepseek-v4-pro';
       CONFIG.aiVisionEnabled = document.getElementById('cfgAIVision').checked;
-      CONFIG.aiVisionModel = document.getElementById('cfgAIVisionModel').value.trim() || 'deepseek-flash';
+      CONFIG.aiVisionModel = document.getElementById('cfgAIVisionModel').value.trim();  // 留空 = 使用主模型
       CONFIG.aiUrl = document.getElementById('cfgAIUrl').value.trim() || 'https://api.deepseek.com/v1/chat/completions';
       CONFIG.deliberateErrorRate = (parseFloat(document.getElementById('cfgErrRate').value) || 0) / 100;
       CONFIG.dailyLimitMinutes = parseFloat(document.getElementById('cfgDaily').value) || 0;
@@ -680,6 +685,8 @@
       const p = PROVIDERS[e.target.value] || PROVIDERS.custom;
       document.getElementById('cfgAIUrl').value = p.url;
       document.getElementById('cfgAIModel').value = p.model;
+      // 视觉模型名各平台不同:DeepSeek 用 deepseek-flash,其他平台先留空(使用主模型),需要时手动填
+      document.getElementById('cfgAIVisionModel').value = e.target.value === 'deepseek' ? 'deepseek-flash' : '';
       document.getElementById('cfgModelSelect').style.display = 'none';  // 已拉取的列表属于上一个平台
     });
     // 下拉列表和输入框保持一致;输入框里的模型不在列表中时,下拉回到提示项
@@ -787,6 +794,7 @@
   let aiFailCount = 0;
   let aiCooldownUntil = 0;
   let aiCooldownWarned = false;
+  const aiParamFallback = new Set();  // 需要 max_completion_tokens 的"接口地址|模型"
   function channelAI(q) {
     return requestAI({
       system: '你是答题助手。按照题型要求直接给出答案,简答计算题可以给出必要的计算步骤,不要输出内部思考过程、重复题目或无关内容。',
@@ -835,7 +843,18 @@
         requestBody.thinking = { type: 'enabled' };
         requestBody.reasoning_effort = 'high';
       }
-      const data = JSON.stringify(requestBody);
+      // OpenAI o 系列 / gpt-5 等推理模型不接受 max_tokens 和非默认 temperature;
+      // 遇到这类 400 时换成 max_completion_tokens、去掉 temperature 重试一次,并记住该接口+模型
+      const paramKey = CONFIG.aiUrl + '|' + model;
+      const applyParamFallback = (body) => {
+        delete body.temperature;
+        if (body.max_tokens !== undefined) {
+          // 推理模型的思考 token 也计入上限,给足余量
+          body.max_completion_tokens = Math.max(body.max_tokens, 16384);
+          delete body.max_tokens;
+        }
+      };
+      if (aiParamFallback.has(paramKey)) applyParamFallback(requestBody);
       const done = (answer, errLog, countAsFailure = true) => {
         if (errLog) {
           if (countAsFailure) {
@@ -858,16 +877,27 @@
         }
         resolve({ form: 'AI', answer });
       };
-      GM_xmlhttpRequest({
+      const send = (body, retried) => GM_xmlhttpRequest({
         method: 'POST',
         url: CONFIG.aiUrl,
-        data,
+        data: JSON.stringify(body),
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + CONFIG.aiKey },
         timeout: 300000,
         onload: (res) => {
           try {
             if (res.status !== 200) {
-              done([], `HTTP ${res.status}: ${String(res.responseText).slice(0, 180)}`);
+              const errText = String(res.responseText);
+              if (res.status === 400 && !retried && !aiParamFallback.has(paramKey) &&
+                  /max_tokens|max_completion_tokens|temperature/i.test(errText) &&
+                  /unsupported|not supported|does not support/i.test(errText)) {
+                aiParamFallback.add(paramKey);
+                log('该模型不接受 max_tokens/temperature 参数,已自动改用 max_completion_tokens 重试', 'warn');
+                applyParamFallback(body);
+                send(body, true);
+                return;
+              }
+              if (retried) aiParamFallback.delete(paramKey);  // 换参数也没用,不再记住
+              done([], `HTTP ${res.status}: ${errText.slice(0, 180)}`);
               return;
             }
             const obj = JSON.parse(res.responseText);
@@ -889,6 +919,7 @@
         onerror: () => { done([], '网络错误'); },
         ontimeout: () => { done([], '超时(300s)'); }
       });
+      send(requestBody, false);
     });
   }
 
